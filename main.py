@@ -1,6 +1,7 @@
 import torch
 import pickle
 import os
+import sys
 import random
 import numpy as np
 from PIL import Image
@@ -81,12 +82,19 @@ def add_gaussian_noise(img, mean, stddev, mask=None):
     return final_img
 
 
-def generate(img, optimizer, ds_method, ds_size, steps, batch_size, c_l2, c_ld, noise_stddev, add_noise=False):
+def generate(img, optimizer, ds_method, ds_size, lr, steps, 
+             batch_size, c_l2, c_ld, noise_stddev, seed, add_noise=False):
+
+    if seed != 0:
+        torch.manual_seed(seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
     ds_size = (ds_size, ds_size)
 
     mask = None
     if type(img) is dict:
-        print(img.keys())
         mask = img['mask']
         img = img['image']
         add_noise = True
@@ -104,7 +112,7 @@ def generate(img, optimizer, ds_method, ds_size, steps, batch_size, c_l2, c_ld, 
     ref_32 = ref_32.detach()
     latent = torch.randn((batch_size, 14, 512), dtype=torch.float, requires_grad=True, device='cuda')
 
-    optim = SphericalOptimizer(optimizers[optimizer], [latent], lr=0.4)
+    optim = SphericalOptimizer(optimizers[optimizer], [latent], lr=lr)
 
     # Schedulers from https://github.com/adamian98/pulse
     lr_schedule = 'linear1cycledrop'
@@ -123,7 +131,8 @@ def generate(img, optimizer, ds_method, ds_size, steps, batch_size, c_l2, c_ld, 
         optim.opt.zero_grad()
         for b in range(batch_size):
             w = leaky(latent[None, b] * gaussian_fit["std"] + gaussian_fit["mean"])
-            img = (G.synthesis(w, noise_mode='random', force_fp32=True) + 1) / 2 # NCHW, float32, dynamic range [-1, +1], no truncation
+            #img = (G.synthesis(w, noise_mode='random', force_fp32=True) + 1) / 2 # NCHW, float32, dynamic range [-1, +1], no truncation
+            img = (G.synthesis(w, noise_mode='none', force_fp32=True) + 1) / 2 # NCHW, float32, dynamic range [-1, +1], no truncation
             img = img.clamp(0, 1)
             img_32 = torch.nn.functional.interpolate(img, size=ds_size, mode=ds_method)
             img_32 = img_32.clamp(0, 1)
@@ -182,6 +191,7 @@ with gr.Blocks(css=css) as app:
                                         info="Downsamples the image to size NxN if it is larger than NxN")
                 with gr.Row():
                     opt = gr.Dropdown(["Adam", "SGD"], value="Adam", label="Optimizer")
+                    lr = gr.Slider(0, 2, value=0.4, label="Learning Rate")
                     steps = gr.Slider(1, 800, value=200, label="Optimization Steps")
                     batch_size = gr.Slider(1, 16, value=1, step=1, label="Batch Size")
                 with gr.Row():
@@ -190,6 +200,8 @@ with gr.Blocks(css=css) as app:
                 with gr.Row():
                     add_noise = gr.Checkbox(label="Add Noise", value=False)
                     noise_stddev = gr.Slider(0, 0.333, value=0.1, label="Noise STD Dev")
+                with gr.Row():
+                    seed = gr.Number(value=0, precision=0, label="Seed", info="If seed is left as 0, it is randomly determined")
                 btn = gr.Button("Generate")
             with gr.Column(elem_id="right"):
                 with gr.Row():
@@ -199,7 +211,7 @@ with gr.Blocks(css=css) as app:
                     with gr.Column():
                         up = gr.Gallery(label="Upsampled", elem_classes="ds_img").style(preview=True)
                 loss_text = gr.Textbox(label="Loss")
-        btn.click(fn=generate, inputs=[inp_img, opt, ds_method, ds_size, steps, batch_size, l2, ld, noise_stddev, add_noise], outputs=[ref, down, up, loss_text])
+        btn.click(fn=generate, inputs=[inp_img, opt, ds_method, ds_size, lr, steps, batch_size, l2, ld, noise_stddev, seed, add_noise], outputs=[ref, down, up, loss_text])
     with gr.Tab("Draw Noise"):
         with gr.Row():
             with gr.Column(elem_id="left"):
@@ -211,6 +223,7 @@ with gr.Blocks(css=css) as app:
                                         info="Downsamples the image to size NxN if it is larger than NxN")
                 with gr.Row():
                     opt = gr.Dropdown(["Adam", "SGD"], value="Adam", label="Optimizer")
+                    lr = gr.Slider(0, 2, value=0.4, label="Learning Rate")
                     steps = gr.Slider(1, 800, value=200, label="Optimization Steps")
                     batch_size = gr.Slider(1, 16, value=1, step=1, label="Batch Size")
                 with gr.Row():
@@ -218,6 +231,8 @@ with gr.Blocks(css=css) as app:
                     ld = gr.Slider(0.001, 1, value=0.1, label="Geodesic Loss Coefficient")
                 with gr.Row():
                     noise_stddev = gr.Slider(0, 0.333, value=0.1, label="Noise STD Dev")
+                with gr.Row():
+                    seed = gr.Number(value=0, precision=0, label="Seed", info="If seed is left as 0, it is randomly determined")
                 btn = gr.Button("Generate")
             with gr.Column(elem_id="right"):
                 with gr.Row():
@@ -227,6 +242,6 @@ with gr.Blocks(css=css) as app:
                     with gr.Column():
                         up = gr.Gallery(label="Upsampled", elem_classes="ds_img").style(preview=True)
                 loss_text = gr.Textbox(label="Loss")
-        btn.click(fn=generate, inputs=[inp_img, opt, ds_method, ds_size, steps, batch_size, l2, ld, noise_stddev], outputs=[ref, down, up, loss_text])
+        btn.click(fn=generate, inputs=[inp_img, opt, ds_method, ds_size, lr, steps, batch_size, l2, ld, noise_stddev, seed], outputs=[ref, down, up, loss_text])
 
 app.launch()

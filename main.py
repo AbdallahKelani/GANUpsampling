@@ -16,6 +16,12 @@ optimizers = {"Adam": torch.optim.Adam,
               "SGD": torch.optim.SGD,
               "Ranger21": Ranger21}
 
+# Schedulers from https://github.com/adamian98/pulse
+schedule_dict = {
+            'fixed': lambda x: 1,
+            'linear1cycle': lambda x: (9*(1-np.abs(x/steps-1/2)*2)+1)/10,
+            'linear1cycledrop': lambda x: (9*(1-np.abs(x/(0.9*steps)-1/2)*2)+1)/10 if x < 0.9*steps else 1/10 + (x-0.9*steps)/(0.1*steps)*(1/1000-1/10),
+        }
 
 # Using the slightly modified loss and optimizer implementations from
 # https://github.com/adamian98/pulse
@@ -104,8 +110,11 @@ def genereate_stylegan_noise(mean, stddev, mask=None):
 
 
 def generate(img, optimizer, ds_method, ds_size, lr, steps, 
-             batch_size, c_l2, c_ld, noise_stddev, seed, use_mapping_net, different_noise_same_latent, add_ref_noise, add_stylegan_noise):
+             batch_size, c_l2, c_ld, c_pairwise, ref_noise_stddev, stylegan_noise_stddev,
+             seed, use_mapping_net, different_noise_same_latent, add_ref_noise, add_stylegan_noise):
     #different_noise_same_latent = True
+    use_scheduler = (optimizer == torch.optim.Adam or optimizer == torch.optim.SGD)
+
     if seed != 0:
         torch.manual_seed(seed)
         random.seed(seed)
@@ -132,10 +141,10 @@ def generate(img, optimizer, ds_method, ds_size, lr, steps,
             ref_imgs = []
             for _ in range(batch_size):
                 print("Here")
-                ref_imgs.append(add_gaussian_noise(ref_32, 0, noise_stddev, mask).detach())
+                ref_imgs.append(add_gaussian_noise(ref_32, 0, ref_noise_stddev, mask).detach())
             ref_32 = ref_imgs
         else:
-            ref_32 = [add_gaussian_noise(ref_32, 0, noise_stddev, mask).detach()]
+            ref_32 = [add_gaussian_noise(ref_32, 0, ref_noise_stddev, mask).detach()]
     
     #ref_32 = ref_32.detach()
     if add_ref_noise and different_noise_same_latent:
@@ -159,29 +168,25 @@ def generate(img, optimizer, ds_method, ds_size, lr, steps,
         opt_settings["num_epochs"] = steps
         opt_settings["num_batches_per_epoch"] = batch_size
     optim = SphericalOptimizer(optimizers[optimizer], [latent], **opt_settings)
-    #optim = SphericalOptimizer(Ranger21, [latent], lr=lr, num_epochs=steps, num_batches_per_epoch=batch_size)
 
-    # Schedulers from https://github.com/adamian98/pulse
-    #lr_schedule = 'linear1cycledrop'
-    #schedule_dict = {
-    #            'fixed': lambda x: 1,
-    #            'linear1cycle': lambda x: (9*(1-np.abs(x/steps-1/2)*2)+1)/10,
-    #            'linear1cycledrop': lambda x: (9*(1-np.abs(x/(0.9*steps)-1/2)*2)+1)/10 if x < 0.9*steps else 1/10 + (x-0.9*steps)/(0.1*steps)*(1/1000-1/10),
-    #        }
-    #schedule_func = schedule_dict[lr_schedule]
-    #scheduler = torch.optim.lr_scheduler.LambdaLR(optim.opt, schedule_func)
-    
+    if use_scheduler:
+        lr_schedule = 'linear1cycledrop'
+        schedule_func = schedule_dict[lr_schedule]
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optim.opt, schedule_func)
+
     noise_mode = 'random'
     custom_noise = None
     if add_stylegan_noise:
-        custom_noise = genereate_stylegan_noise(0, noise_stddev, mask)
+        custom_noise = genereate_stylegan_noise(0, stylegan_noise_stddev, mask)
         noise_mode = 'custom'
-
+        best_latents = [None] * batch_size
     min_loss = [np.inf] * batch_size
     best = [None] * batch_size
     best_32 = [None] * batch_size
     for i in range(steps):
         optim.opt.zero_grad()
+        images = []
+        batch_loss = 0
         for b in range(batch_size):
             w = leaky(latent[None, b] * gaussian_fit["std"] + gaussian_fit["mean"])
             #img = (G.synthesis(w, noise_mode='random', force_fp32=True) + 1) / 2 # NCHW, float32, dynamic range [-1, +1], no truncation
@@ -200,9 +205,28 @@ def generate(img, optimizer, ds_method, ds_size, lr, steps,
                     min_loss[b] = l.detach()
                     best[b] = img.clone().detach()
                     best_32[b] = img_32.clone().detach()
-            l.backward()
+                    if add_stylegan_noise:
+                        best_latents[b] = w
+            batch_loss += l
+            #l.backward()
+            if c_pairwise != 0:
+                images.append(img)
+        if c_pairwise != 0:
+            pairwise_loss = 0
+            images = torch.stack(images)
+            for i in range(batch_size):
+                for j in range(i + 1, batch_size):
+                    pairwise_loss += torch.dist(images[i], images[j], 2)
+            batch_loss -= (pairwise_loss / batch_size) * c_pairwise
+        batch_loss.backward()
         optim.step()
-    #    scheduler.step()
+        if use_scheduler:
+            scheduler.step()
+
+    if add_stylegan_noise:
+        for b in range(batch_size):
+            best[b] = ((G.synthesis(best_latents[b], noise_mode='random', force_fp32=True) + 1) / 2).detach()
+    
 
     ref_32 = [x.cpu().numpy().transpose((0, 2, 3, 1))[0] for x in ref_32]
     best_32 = [x.cpu().numpy().transpose((0, 2, 3, 1))[0] for x in best_32]
@@ -237,7 +261,6 @@ css = '''
     min-width: 256px !important;
 }
 '''
-
 with gr.Blocks(css=css) as app:
     with gr.Tab("Generate"):
         with gr.Row():
@@ -249,19 +272,21 @@ with gr.Blocks(css=css) as app:
                     ds_size = gr.Slider(2, 256, value=32, label="Downsampled Size NxN",
                                         info="Downsamples the image to size NxN if it is larger than NxN")
                 with gr.Row():
-                    opt = gr.Dropdown(["Adam", "SGD", "Ranger21"], value="Adam", label="Optimizer")
+                    opt = gr.Dropdown(["Adam", "SGD", "Ranger21"], value="Ranger21", label="Optimizer")
                     lr = gr.Slider(0, 2, value=0.4, label="Learning Rate")
                     steps = gr.Slider(1, 800, value=200, label="Optimization Steps")
                     batch_size = gr.Slider(1, 16, value=1, step=1, label="Batch Size")
                 with gr.Row():
-                    l2 = gr.Slider(10, 1000, value=100, label="MSE Coefficient")
-                    ld = gr.Slider(0.001, 1, value=0.1, label="Geodesic Loss Coefficient")
+                    l2 = gr.Slider(10, 1000, value=405, label="MSE Coefficient") # 100
+                    ld = gr.Slider(0.001, 1, value=0.058, label="Geodesic Loss Coefficient") # 0.1
+                    l_pairwise = gr.Slider(0.0, 0.1, value=0, label="Pairwise Batch Loss Coefficient")
                 with gr.Row():
                     add_ref_noise = gr.Checkbox(label="Add Img Noise", value=False, info="Gaussian noise with mean 0")
+                    ref_noise_stddev = gr.Slider(0, 0.333, value=0.1, label="Image Noise STD Dev")
                     add_stylegan_noise = gr.Checkbox(label="Add StyleGAN Noise", value=False, info="Gaussian noise with mean 0")
+                    stylegan_noise_stddev = gr.Slider(0, 0.333, value=0.1, label="StyleGAN Noise STD Dev")
                     different_noise_same_latent = gr.Checkbox(label="Use different noise on same latents", value=False
                                                               , info="Samples different noise to add to reference images, but keeps the latents same across a batch")
-                    noise_stddev = gr.Slider(0, 0.333, value=0.1, label="Noise STD Dev")
                 with gr.Row():
                     seed = gr.Number(value=0, precision=0, label="Seed", info="If seed is left as 0, it is randomly determined")
                     use_mapping_net = gr.Checkbox(label="Use mapping network", value=False
@@ -277,7 +302,7 @@ with gr.Blocks(css=css) as app:
                     with gr.Column():
                         up = gr.Gallery(label="Upsampled", elem_classes="ds_img").style(preview=True)
                 loss_text = gr.Textbox(label="Loss")
-        btn.click(fn=generate, inputs=[inp_img, opt, ds_method, ds_size, lr, steps, batch_size, l2, ld, noise_stddev, seed, use_mapping_net, different_noise_same_latent, add_ref_noise, add_stylegan_noise], outputs=[ref, down, up, loss_text])
+        btn.click(fn=generate, inputs=[inp_img, opt, ds_method, ds_size, lr, steps, batch_size, l2, ld, l_pairwise, ref_noise_stddev, stylegan_noise_stddev, seed, use_mapping_net, different_noise_same_latent, add_ref_noise, add_stylegan_noise], outputs=[ref, down, up, loss_text])
     with gr.Tab("Draw Noise"):
         with gr.Row():
             with gr.Column(elem_id="left"):
@@ -288,19 +313,21 @@ with gr.Blocks(css=css) as app:
                     ds_size = gr.Slider(2, 256, value=32, label="Downsampled Size NxN",
                                         info="Downsamples the image to size NxN if it is larger than NxN")
                 with gr.Row():
-                    opt = gr.Dropdown(["Adam", "SGD", "Ranger21"], value="Adam", label="Optimizer")
+                    opt = gr.Dropdown(["Adam", "SGD", "Ranger21"], value="Ranger21", label="Optimizer")
                     lr = gr.Slider(0, 2, value=0.4, label="Learning Rate")
                     steps = gr.Slider(1, 800, value=200, label="Optimization Steps")
                     batch_size = gr.Slider(1, 16, value=1, step=1, label="Batch Size")
                 with gr.Row():
-                    l2 = gr.Slider(10, 1000, value=100, label="MSE Coefficient")
-                    ld = gr.Slider(0.001, 1, value=0.1, label="Geodesic Loss Coefficient")
+                    l2 = gr.Slider(10, 1000, value=405, label="MSE Coefficient") # 100
+                    ld = gr.Slider(0.001, 1, value=0.058, label="Geodesic Loss Coefficient") # 0.1  
+                    l_pairwise = gr.Slider(0.0, 0.1, value=0, label="Pairwise Batch Loss Coefficient")
                 with gr.Row():
                     add_ref_noise = gr.Checkbox(label="Add Img Noise", value=True, info="Gaussian noise with mean 0")
+                    ref_noise_stddev = gr.Slider(0, 0.333, value=0.1, label="Image Noise STD Dev")
                     add_stylegan_noise = gr.Checkbox(label="Add StyleGAN Noise", value=False, info="Gaussian noise with mean 0")
+                    stylegan_noise_stddev = gr.Slider(0, 0.333, value=0.1, label="StyleGAN Noise STD Dev")
                     different_noise_same_latent = gr.Checkbox(label="Use different noise on same latents", value=False
                                             , info="Samples different noise to add to reference images, but keeps the latents same across a batch")
-                    noise_stddev = gr.Slider(0, 0.333, value=0.1, label="Noise STD Dev")
                 with gr.Row():
                     seed = gr.Number(value=0, precision=0, label="Seed", info="If seed is left as 0, it is randomly determined")
                     use_mapping_net = gr.Checkbox(label="Use mapping network", value=False
@@ -316,6 +343,6 @@ with gr.Blocks(css=css) as app:
                     with gr.Column():
                         up = gr.Gallery(label="Upsampled", elem_classes="ds_img").style(preview=True)
                 loss_text = gr.Textbox(label="Loss")
-        btn.click(fn=generate, inputs=[inp_img, opt, ds_method, ds_size, lr, steps, batch_size, l2, ld, noise_stddev, seed, use_mapping_net, different_noise_same_latent, add_ref_noise, add_stylegan_noise], outputs=[ref, down, up, loss_text])
+        btn.click(fn=generate, inputs=[inp_img, opt, ds_method, ds_size, lr, steps, batch_size, l2, ld, l_pairwise, ref_noise_stddev, stylegan_noise_stddev, seed, use_mapping_net, different_noise_same_latent, add_ref_noise, add_stylegan_noise], outputs=[ref, down, up, loss_text])
 
 app.launch()

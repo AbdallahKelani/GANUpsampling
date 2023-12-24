@@ -1,4 +1,4 @@
-# Upsampling with StyleGAN3
+# Multi-modal Photo Upsampling via Latent Space Exploration of StyleGAN
 ## How to run:
 1. Clone the repository with the StyleGAN3 submodule
 ```

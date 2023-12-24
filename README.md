@@ -1,4 +1,4 @@
-# upsampling
+# Upsampling with StyleGAN3
 ## How to run:
 1. Clone the repository with the StyleGAN3 submodule
 ```
